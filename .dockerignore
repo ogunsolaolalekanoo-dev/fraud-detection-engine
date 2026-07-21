@@ -1,0 +1,14 @@
+.git
+.gitignore
+.vscode
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+mlruns
+mlflow.db
+catboost_info
+outputs
+.env
+.DS_Store
