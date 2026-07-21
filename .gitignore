@@ -5,3 +5,22 @@ __pycache__/
 .env
 *.egg-info/
 .ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# MLflow
+mlflow.db
+
+# CatBoost logs
+catboost_info/
+
+# Generated outputs
+outputs/.DS_Store
+.vscode/
+mlflow.db
+catboost_info/
+outputs/

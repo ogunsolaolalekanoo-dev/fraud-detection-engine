@@ -11,3 +11,5 @@ pyarrow
 matplotlib
 seaborn
 pytest
+
+catboost

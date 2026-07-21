@@ -15,7 +15,8 @@ Evaluation philosophy (unchanged):
   Kaggle leaderboard scores. We optimize decision threshold using F-beta(2)
   to weight recall over precision — missing fraud costs more than a false alarm.
 """
-
+import json
+import pickle
 import numpy as np
 import pandas as pd
 import mlflow
@@ -90,13 +91,18 @@ def train_isolation_forest(X_train: pd.DataFrame,
     # Normalize scores to [0,1]: higher = more anomalous
     train_scores = iso.decision_function(X_train)
     val_scores   = iso.decision_function(X_val)
+        # Persist normalization statistics for consistent serving-time scores
+    iso.score_min_ = float(train_scores.min())
+    iso.score_max_ = float(train_scores.max())
 
-    def normalize(scores, ref_scores):
-        min_s, max_s = ref_scores.min(), ref_scores.max()
-        return 1 - (scores - min_s) / (max_s - min_s + 1e-8)
+    def normalize(scores):
+        return 1 - (
+            (scores - iso.score_min_)
+            / (iso.score_max_ - iso.score_min_ + 1e-8)
+        )
 
-    train_anomaly = normalize(train_scores, train_scores)
-    val_anomaly   = normalize(val_scores, train_scores)
+    train_anomaly = normalize(train_scores)
+    val_anomaly = normalize(val_scores)
 
     pr_auc  = average_precision_score(y_val, val_anomaly)
     roc_auc = roc_auc_score(y_val, val_anomaly)
@@ -407,6 +413,30 @@ def train_all(features_path: str = "data/processed/features.parquet"):
 
     # ── Step 4: XGBoost ──
     xgb_results = train_xgboost(X_train_v2, y_train, X_val_v2, y_val)
+        # Save production inference artifacts
+    artifacts_dir = Path("data/processed")
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(artifacts_dir / "xgboost_model.pkl", "wb") as f:
+        pickle.dump(xgb_results["model"], f)
+
+    with open(artifacts_dir / "isolation_forest.pkl", "wb") as f:
+        pickle.dump(iso_model, f)
+
+    metadata = {
+        "model_name": "XGBoost",
+        "version": "2.0.0",
+        "pr_auc": float(xgb_results["pr_auc"]),
+        "roc_auc": float(xgb_results["roc_auc"]),
+        "threshold": 0.3,
+        "feature_count": len(feature_cols_v2),
+        "features": feature_cols_v2
+    }
+
+    with open(artifacts_dir / "model_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print("Production artifacts saved to data/processed/")
 
     # ── Step 4b: CatBoost ──
     cat_results = train_catboost(X_train_v2, y_train, X_val_v2, y_val)
@@ -427,8 +457,11 @@ def train_all(features_path: str = "data/processed/features.parquet"):
     w_xgb    = xgb_results["pr_auc"]  / total
 
     ensemble = ensemble_predictions(
-        lgbm_results["y_prob"], xgb_results["y_prob"], cat_results["y_prob"],
-        y_val, weights=(w_lgbm, w_xgb, w_cat)
+        lgbm_results["y_prob"],
+        cat_results["y_prob"],
+        xgb_results["y_prob"],
+        y_val,
+        weights=(w_lgbm, w_xgb, w_cat)
     )
     results["ensemble"] = ensemble
 

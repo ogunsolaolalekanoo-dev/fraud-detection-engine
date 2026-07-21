@@ -20,7 +20,8 @@ Example:
     -H "Content-Type: application/json" \
     -d '{"TransactionAmt": 1500.0, "card4": "visa", "tx_hour": 3}'
 """
-
+import json
+import pickle
 import numpy as np
 import pandas as pd
 import mlflow
@@ -49,16 +50,23 @@ app = FastAPI(
 )
 
 # Global state
-MODEL           = None
-PIPELINE        = None
-EXPLAINER       = None
-MODEL_METADATA  = {}
-PIPELINE_PATH   = "data/processed/feature_pipeline.pkl"
+MODEL = None
+PIPELINE = None
+ISOLATION_FOREST = None
+EXPLAINER = None
+MODEL_METADATA = {}
+
+ARTIFACTS_DIR = Path("data/processed")
+PIPELINE_PATH = ARTIFACTS_DIR / "feature_pipeline.pkl"
+MODEL_PATH = ARTIFACTS_DIR / "xgboost_model.pkl"
+ISOLATION_FOREST_PATH = ARTIFACTS_DIR / "isolation_forest.pkl"
+METADATA_PATH = ARTIFACTS_DIR / "model_metadata.json"
 
 
 # ── Request / Response schemas ─────────────────────────────────────────────────
 
 class TransactionRequest(BaseModel):
+    TransactionDT: Optional[float] = Field(None, ge=0)
     TransactionAmt: float       = Field(..., gt=0)
     ProductCD:      Optional[str]   = None
     card1:          Optional[float] = None
@@ -100,9 +108,10 @@ class FraudPrediction(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status:        str
-    model_loaded:  bool
+    status: str
+    model_loaded: bool
     pipeline_loaded: bool
+    isolation_forest_loaded: bool
     model_version: str
 
 
@@ -114,45 +123,75 @@ def get_risk_level(prob: float) -> tuple:
     elif prob >= 0.3: return "MONITOR", "MEDIUM"
     else:             return "APPROVE", "LOW"
 
-
-# ── Model loading ──────────────────────────────────────────────────────────────
-
 @app.on_event("startup")
 async def load_model():
-    global MODEL, PIPELINE, EXPLAINER, MODEL_METADATA
+    global MODEL
+    global PIPELINE
+    global ISOLATION_FOREST
+    global EXPLAINER
+    global MODEL_METADATA
 
-    # Load feature pipeline
-    if Path(PIPELINE_PATH).exists():
-        PIPELINE = FeaturePipeline.load(PIPELINE_PATH)
-        print(f"Feature pipeline loaded: {len(PIPELINE.feature_columns)} features")
-    else:
-        print(f"WARNING: No feature pipeline found at {PIPELINE_PATH}")
+    missing_artifacts = []
+
+    for path in (
+        PIPELINE_PATH,
+        MODEL_PATH,
+        ISOLATION_FOREST_PATH,
+        METADATA_PATH,
+    ):
+        if not path.exists():
+            missing_artifacts.append(str(path))
+
+    if missing_artifacts:
+        print("WARNING: Missing production artifacts:")
+        for artifact in missing_artifacts:
+            print(f"  - {artifact}")
+        print("Run: python src/pipeline.py --force-rebuild")
         return
 
-    # Load XGBoost model directly from disk
     try:
-        import pickle
-        with open("data/processed/xgboost_model.pkl", "rb") as f:
+        PIPELINE = FeaturePipeline.load(PIPELINE_PATH)
+
+        with open(MODEL_PATH, "rb") as f:
             MODEL = pickle.load(f)
-        MODEL_METADATA = {
-            "pr_auc":    0.6003,
-            "roc_auc":   0.9221,
-            "threshold": 0.3,
-            "version":   "2.0.0"
-        }
-        print(f"XGBoost model loaded — PR-AUC: {MODEL_METADATA['pr_auc']:.4f}")
+
+        with open(ISOLATION_FOREST_PATH, "rb") as f:
+            ISOLATION_FOREST = pickle.load(f)
+
+        with open(METADATA_PATH, "r") as f:
+            MODEL_METADATA = json.load(f)
+
+        EXPLAINER = shap.TreeExplainer(MODEL)
+
+        print(
+            f"Production model loaded successfully "
+            f"(version {MODEL_METADATA.get('version', 'unknown')})"
+        )
+
     except Exception as e:
+        MODEL = None
+        PIPELINE = None
+        ISOLATION_FOREST = None
+        EXPLAINER = None
+        MODEL_METADATA = {}
+
         print(f"Model loading error: {e}")
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
+    all_loaded = all(
+        artifact is not None
+        for artifact in (MODEL, PIPELINE, ISOLATION_FOREST)
+    )
+
     return HealthResponse(
-        status="healthy",
+        status="healthy" if all_loaded else "degraded",
         model_loaded=MODEL is not None,
         pipeline_loaded=PIPELINE is not None,
-        model_version=MODEL_METADATA.get("version", "not_loaded")
+        isolation_forest_loaded=ISOLATION_FOREST is not None,
+        model_version=MODEL_METADATA.get("version", "not_loaded"),
     )
 
 
@@ -175,10 +214,21 @@ async def predict(request: TransactionRequest):
     In Uber's production system this runs in <10ms backed by a feature store.
     This FastAPI implementation demonstrates the same architectural pattern.
     """
-    if MODEL is None or PIPELINE is None:
+    if any(
+        artifact is None
+        for artifact in (
+            MODEL,
+            PIPELINE,
+            ISOLATION_FOREST,
+            EXPLAINER,
+        )
+    ):
         raise HTTPException(
             status_code=503,
-            detail="Model or pipeline not loaded. Run src/pipeline.py --force-rebuild first."
+            detail=(
+                "Production model artifacts are not fully loaded. "
+                "Run src/pipeline.py --force-rebuild first."
+            ),
         )
 
     t0 = time.perf_counter()
@@ -187,40 +237,84 @@ async def predict(request: TransactionRequest):
     tx_dict = request.model_dump()
     X = PIPELINE.transform_single(tx_dict)
 
-    # Add isolation forest score (neutral at serving time)
-    X["isolation_forest_score"] = 0.0
+    # Generate the serving-time Isolation Forest anomaly score
+    if ISOLATION_FOREST is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Isolation Forest artifact is not loaded.",
+        )
+
+    # Isolation Forest was trained before isolation_forest_score was added,
+    # so use only the exact features seen during fitting.
+    if hasattr(ISOLATION_FOREST, "feature_names_in_"):
+        if_columns = list(ISOLATION_FOREST.feature_names_in_)
+        X_if = X.reindex(columns=if_columns, fill_value=-999)
+    else:
+        X_if = X.drop(columns=["isolation_forest_score"], errors="ignore")
+
+    raw_if_score = float(ISOLATION_FOREST.decision_function(X_if)[0])
+
+    score_min = getattr(ISOLATION_FOREST, "score_min_", None)
+    score_max = getattr(ISOLATION_FOREST, "score_max_", None)
+
+    if score_min is None or score_max is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Isolation Forest normalization metadata is unavailable.",
+        )
+
+    normalized_if_score = 1 - (
+        (raw_if_score - score_min)
+        / (score_max - score_min + 1e-8)
+    )
+
+    normalized_if_score = float(np.clip(normalized_if_score, 0.0, 1.0))
+    X["isolation_forest_score"] = normalized_if_score
     
-    # Ensure correct column order matching training
-    if "isolation_forest_score" not in X.columns:
-        X["isolation_forest_score"] = 0.0
+    expected_features = MODEL_METADATA.get("features", [])
+
+    if expected_features:
+        missing_features = [
+            feature for feature in expected_features
+            if feature not in X.columns
+        ]
+
+        for feature in missing_features:
+            X[feature] = 0.0
+
+        X = X.reindex(columns=expected_features, fill_value=0.0)
     
     # Predict
     fraud_prob = float(MODEL.predict_proba(X)[0, 1])
 
-    # SHAP explanation — initialize lazily on first call
-   
+    # Generate SHAP explanation using the startup-loaded explainer
     try:
-        global EXPLAINER
         if EXPLAINER is None:
-            import shap
-            EXPLAINER = shap.Explainer(MODEL.predict_proba, X, max_evals=2*len(X.columns)+1)
+            raise RuntimeError("SHAP explainer is not loaded.")
+
         shap_values = EXPLAINER.shap_values(X)
         if isinstance(shap_values, list):
             shap_values = shap_values[1]
-        shap_row = np.array(shap_values).flatten()
-        # Trim shap_row to match feature count
-        shap_row = shap_row[:len(X.columns)]
+
+        shap_row = np.asarray(shap_values).reshape(-1)
+
         top_indices = np.argsort(np.abs(shap_row))[::-1][:3]
+
         top_factors = [
             {
-                "feature":    X.columns[i],
-                "shap_value": round(float(shap_row[i]), 4),
-                "direction":  "increases_risk" if shap_row[i] > 0 else "decreases_risk"
+                "feature": X.columns[index],
+                "shap_value": round(float(shap_row[index]), 4),
+                "direction": (
+                    "increases_risk"
+                    if shap_row[index] > 0
+                    else "decreases_risk"
+                ),
             }
-            for i in top_indices
+            for index in top_indices
         ]
-    except Exception as e:
-        print(f"SHAP error: {e}")
+
+    except Exception as exc:
+        print(f"SHAP error: {exc}")
         top_factors = []
 
     threshold           = MODEL_METADATA.get("threshold", 0.3)

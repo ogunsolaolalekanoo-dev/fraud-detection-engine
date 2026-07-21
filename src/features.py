@@ -539,7 +539,8 @@ class FeaturePipeline:
             df["time_of_day_seconds"] = df["TransactionDT"] % 86400
             df["is_night_weekend"]    = (df["is_night"] & df["is_weekend"]).astype(int)
         else:
-            hour = tx.get("tx_hour", 12)
+            hour = tx.get("tx_hour")
+            hour = 12 if hour is None else int(hour)
             df["tx_hour"]             = hour
             df["tx_day"]              = 0
             df["is_night"]            = int(hour <= 5)
