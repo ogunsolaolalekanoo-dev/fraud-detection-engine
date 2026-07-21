@@ -24,3 +24,13 @@ outputs/.DS_Store
 mlflow.db
 catboost_info/
 outputs/
+
+# Keep raw and processed datasets ignored, but track runtime model artifacts.
+!data/
+data/*
+!data/processed/
+data/processed/*
+!data/processed/model_metadata.json
+!data/processed/feature_pipeline.pkl
+!data/processed/isolation_forest.pkl
+!data/processed/xgboost_model.pkl
