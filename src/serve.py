@@ -36,7 +36,12 @@ from pydantic import BaseModel, Field
 sys.path.insert(0, os.path.dirname(__file__))
 
 from features import FeaturePipeline
-from src.database import create_database_tables, save_prediction_log
+from src.database import (
+    create_database_tables,
+    get_prediction_metrics,
+    get_recent_predictions,
+    save_prediction_log,
+)
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -292,6 +297,58 @@ async def model_info() -> dict:
         }
 
     return MODEL_METADATA
+
+@app.get("/predictions")
+async def recent_predictions(
+    limit: int = 20,
+) -> dict:
+    """
+    Return the most recent stored fraud predictions.
+
+    The limit is restricted to a maximum of 100 records.
+    """
+
+    try:
+        predictions = get_recent_predictions(limit=limit)
+
+        return {
+            "count": len(predictions),
+            "predictions": predictions,
+        }
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to retrieve prediction history: %s",
+            exc,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Prediction history is temporarily unavailable.",
+        ) from exc
+
+
+@app.get("/metrics")
+async def prediction_metrics() -> dict:
+    """
+    Return aggregate monitoring metrics for stored predictions.
+    """
+
+    try:
+        return get_prediction_metrics()
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to retrieve prediction metrics: %s",
+            exc,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Prediction metrics are temporarily unavailable.",
+        ) from exc
+
+
 
 
 @app.post(
